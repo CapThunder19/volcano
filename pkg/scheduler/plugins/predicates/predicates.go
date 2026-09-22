@@ -804,52 +804,33 @@ func (pp *PredicatesPlugin) Predicate(task *api.TaskInfo, node *api.NodeInfo, st
 
 // BatchNodeOrder runs all Score plugins for the given task and nodes.
 func (pp *PredicatesPlugin) BatchNodeOrder(task *api.TaskInfo, nodes []fwk.NodeInfo, state *k8sframework.CycleState) (map[string]float64, error) {
-	nodeScores := make(map[string]float64, len(nodes))
-	skippedScorePlugins := map[string]struct{}{}
-
+	// Preserve the configured plugin order while adapting it to RunScorePlugins' common input.
+	preScorePluginEntries := make([]nodescore.PreScorePluginEntry, 0, len(pp.PreScoreOrder))
 	for _, name := range pp.PreScoreOrder {
 		plugin, exists := pp.PreScorePlugins[name]
 		if !exists {
 			continue
 		}
-
-		skipScore, err := nodescore.RunPreScorePlugin(plugin, state, task.Pod, nodes)
-		if err != nil {
-			return nil, fmt.Errorf("pre-score plugin %s failed: %w", name, err)
-		}
-		if skipScore {
-			skippedScorePlugins[name] = struct{}{}
-		}
+		preScorePluginEntries = append(preScorePluginEntries, nodescore.PreScorePluginEntry{Name: name, Plugin: plugin})
 	}
 
-	// Run all Score plugins
+	scorePluginEntries := make([]nodescore.ScorePluginEntry, 0, len(pp.ScoreOrder))
 	for _, name := range pp.ScoreOrder {
-		if _, skipped := skippedScorePlugins[name]; skipped {
-			continue
-		}
 		plugin, exists := pp.ScorePlugins[name]
 		if !exists {
 			continue
 		}
-		// Get weight from ScoreWeights map, default to 1 if not set
 		weight := 1
 		if w, exists := pp.ScoreWeights[name]; exists {
 			weight = w
 		}
-
-		// Calculate score using the helper function
-		pluginScores, err := nodescore.CalculatePluginScore(name, plugin, state, task.Pod, nodes, weight)
-		if err != nil {
-			return nil, err
-		}
-
-		// Accumulate scores
-		for _, node := range nodes {
-			nodeName := node.Node().Name
-			nodeScores[nodeName] += pluginScores[nodeName]
-		}
+		scorePluginEntries = append(scorePluginEntries, nodescore.ScorePluginEntry{Name: name, Plugin: plugin, Weight: weight})
 	}
 
+	nodeScores, err := nodescore.RunScorePlugins(preScorePluginEntries, scorePluginEntries, state, task.Pod, nodes)
+	if err != nil {
+		return nil, err
+	}
 	klog.V(4).Infof("Batch Total Score for task %s/%s is: %v", task.Namespace, task.Name, nodeScores)
 	return nodeScores, nil
 }
