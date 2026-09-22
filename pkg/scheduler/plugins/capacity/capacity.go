@@ -36,6 +36,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/api/helpers"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
+	"volcano.sh/volcano/pkg/scheduler/plugins/capacity/hintprovider"
 	"volcano.sh/volcano/pkg/scheduler/plugins/util"
 )
 
@@ -452,6 +453,9 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 	}
 
 	hierarchyEnabled := ssn.HierarchyEnabled(cp.Name())
+	// Hierarchical capacity rejections are evaluated every session until hints
+	// can identify the Queue whose quota rejected the Job and related siblings.
+	ssn.AddHintProvider(cp.Name(), hintprovider.NewCapacityHintProvider(hierarchyEnabled))
 	readyToSchedule := true
 	if hierarchyEnabled {
 		readyToSchedule = cp.buildHierarchicalQueueAttrs(ssn)
