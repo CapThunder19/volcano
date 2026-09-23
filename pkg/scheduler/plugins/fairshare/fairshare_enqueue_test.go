@@ -17,6 +17,7 @@ limitations under the License.
 package fairshare
 
 import (
+	"fmt"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -32,42 +33,122 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
 
-func TestJobTotalResource_SumsTasksWhenPresent(t *testing.T) {
-	job := api.NewJobInfo("ns/j",
-		&api.TaskInfo{UID: "t1", Job: "ns/j", Resreq: api.NewResource(api.BuildResourceList("1", "1G"))},
-		&api.TaskInfo{UID: "t2", Job: "ns/j", Resreq: api.NewResource(api.BuildResourceList("2", "1G"))},
-	)
-	job.SetPodGroup(&api.PodGroup{PodGroup: scheduling.PodGroup{
-		Spec: scheduling.PodGroupSpec{MinResources: ptrResourceList(api.BuildResourceList("10", "1G"))},
-	}})
+func buildJob(minCPU string, taskCPU ...string) *api.JobInfo {
+	tasks := make([]*api.TaskInfo, 0, len(taskCPU))
+	for i, cpu := range taskCPU {
+		tasks = append(tasks, &api.TaskInfo{
+			UID:    api.TaskID(fmt.Sprintf("t%d", i)),
+			Job:    "ns/j",
+			Resreq: api.NewResource(api.BuildResourceList(cpu, "1G")),
+		})
+	}
 
-	if got := jobTotalResource(job, v1.ResourceCPU); got != 3000 {
-		t.Errorf("jobTotalResource() = %v, want 3000 (sum of tasks, not MinResources)", got)
+	job := api.NewJobInfo("ns/j", tasks...)
+	pg := &api.PodGroup{}
+	if minCPU != "" {
+		minResources := api.BuildResourceList(minCPU, "1G")
+		pg.Spec.MinResources = &minResources
+	}
+	job.SetPodGroup(pg)
+
+	return job
+}
+
+func TestJobTotalResource(t *testing.T) {
+	tests := []struct {
+		name    string
+		minCPU  string
+		taskCPU []string
+		want    float64
+	}{
+		{
+			name:    "sums tasks and ignores MinResources when tasks exist",
+			minCPU:  "10",
+			taskCPU: []string{"1", "2"},
+			want:    3000,
+		},
+		{
+			name:   "falls back to MinResources when the job has no tasks",
+			minCPU: "2",
+			want:   2000,
+		},
+		{
+			name: "zero when the job has neither tasks nor MinResources",
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			job := buildJob(tt.minCPU, tt.taskCPU...)
+			if got := jobTotalResource(job, v1.ResourceCPU); got != tt.want {
+				t.Errorf("jobTotalResource() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
-func TestJobTotalResource_FallsBackToMinResourcesWithoutTasks(t *testing.T) {
-	job := api.NewJobInfo("ns/j")
-	job.SetPodGroup(&api.PodGroup{PodGroup: scheduling.PodGroup{
-		Spec: scheduling.PodGroupSpec{MinResources: ptrResourceList(api.BuildResourceList("2", "1G"))},
-	}})
+func TestNamespaceDemand(t *testing.T) {
+	options.Default()
+	oneCPU := api.BuildResourceList("1", "1G")
 
-	if got := jobTotalResource(job, v1.ResourceCPU); got != 2000 {
-		t.Errorf("jobTotalResource() = %v, want 2000 (from MinResources)", got)
+	tests := []struct {
+		name       string
+		podGroups  []*schedulingv1.PodGroup
+		pods       []*v1.Pod
+		wantDemand float64
+	}{
+		{
+			name: "pending job with pods counts its pending tasks",
+			podGroups: []*schedulingv1.PodGroup{
+				util.BuildPodGroupWithMinResources("pg1", "ns", "q1", 1, nil, oneCPU, schedulingv1.PodGroupPending),
+			},
+			pods: []*v1.Pod{
+				util.BuildPod("ns", "p1", "", v1.PodPending, oneCPU, "pg1", nil, nil),
+			},
+			wantDemand: 1000,
+		},
+		{
+			name: "pending job without pods counts MinResources",
+			podGroups: []*schedulingv1.PodGroup{
+				util.BuildPodGroupWithMinResources("pg1", "ns", "q1", 1, nil, oneCPU, schedulingv1.PodGroupPending),
+			},
+			wantDemand: 1000,
+		},
+		{
+			name: "admitted job without pods is not counted",
+			podGroups: []*schedulingv1.PodGroup{
+				util.BuildPodGroupWithMinResources("pg1", "ns", "q1", 1, nil, oneCPU, schedulingv1.PodGroupInqueue),
+			},
+			wantDemand: 0,
+		},
 	}
-}
 
-func TestJobTotalResource_NoTasksNoMinResources(t *testing.T) {
-	job := api.NewJobInfo("ns/j")
-	job.SetPodGroup(&api.PodGroup{})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer saveAndResetState(t)()
 
-	if got := jobTotalResource(job, v1.ResourceCPU); got != 0 {
-		t.Errorf("jobTotalResource() = %v, want 0", got)
+			test := uthelper.TestCommonStruct{
+				Plugins:   map[string]framework.PluginBuilder{PluginName: New},
+				PodGroups: tt.podGroups,
+				Pods:      tt.pods,
+				Nodes:     []*v1.Node{util.BuildNode("n1", api.BuildResourceList("4", "4G"), nil)},
+				Queues:    []*schedulingv1.Queue{util.BuildQueue("q1", 1, api.BuildResourceList("4", "4G"))},
+			}
+			ssn := test.RegisterSession(nil, nil)
+			defer test.Close()
+
+			fsp := New(framework.Arguments{
+				"fairshare.targetQueues": "q1",
+				"fairshare.resourceKey":  "cpu",
+			}).(*fairSharePlugin)
+			fsp.OnSessionOpen(ssn)
+
+			if got := fsp.queues["q1"].namespaceDemand["ns"]; got != tt.wantDemand {
+				t.Errorf("namespaceDemand[ns] = %v, want %v", got, tt.wantDemand)
+			}
+		})
 	}
-}
-
-func ptrResourceList(rl v1.ResourceList) *v1.ResourceList {
-	return &rl
 }
 
 func TestEnqueueGate(t *testing.T) {
